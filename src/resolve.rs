@@ -598,7 +598,7 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
         Ok(())
     }
 
-    fn find_satisfier_aur_cache(&self, dep: &Dep) -> Option<&ArcPackage> {
+    fn find_preferred_satisfier_aur_cache(&self, dep: &Dep) -> Option<&ArcPackage> {
         if let Some(pkg) = self
             .cache
             .iter()
@@ -614,9 +614,34 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
             return Some(pkg);
         }
 
-        self.cache
-            .iter()
-            .find(|pkg| pkg.satisfies_dep(dep, self.flags.contains(Flags::NO_DEP_VERSION)))
+        None
+    }
+
+    fn find_satisfier_aur_cache(&self, dep: &Dep) -> Option<&ArcPackage> {
+        self.find_preferred_satisfier_aur_cache(dep).or_else(|| {
+            self.cache
+                .iter()
+                .find(|pkg| pkg.satisfies_dep(dep, self.flags.contains(Flags::NO_DEP_VERSION)))
+        })
+    }
+
+    fn recursive_cache_satisfiers<S: AsRef<str>>(&self, deps: &[S]) -> Vec<ArcPackage> {
+        let nover = self.flags.contains(Flags::NO_DEP_VERSION);
+        let mut satisfiers = Vec::new();
+
+        for dep in deps {
+            let dep = Depend::new(dep.as_ref());
+            satisfiers.extend(
+                self.cache
+                    .iter()
+                    .filter(|pkg| pkg.satisfies_dep(&dep, nover))
+                    .cloned(),
+            );
+        }
+
+        satisfiers.sort_unstable();
+        satisfiers.dedup();
+        satisfiers
     }
 
     /// Expected behaviour
@@ -634,29 +659,15 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
 
             debug!("satisfiers for '{:?}': {:?})", dep.to_string(), pkgs);
 
-            if !target {
-                if let Some(pkg) = pkgs.iter().find(|&&p| self.alpm.localdb().pkg(p).is_ok()) {
-                    debug!("picked from cache: {}", pkg);
-                    return self.cache.get(*pkg);
-                }
-                if let Some(pkg) = pkgs.iter().find(|&&p| p == dep.name()) {
-                    debug!("picked from cache: {}", pkg);
-                    return self.cache.get(*pkg);
-                }
+            if !target && let Some(pkg) = self.find_preferred_satisfier_aur_cache(dep) {
+                debug!("picked from cache: {}", pkg.name);
+                return Some(pkg);
             }
 
             if pkgs.len() == 1 {
                 return self.cache.get(pkgs[0]);
             } else if pkgs.is_empty() {
                 return None;
-            }
-
-            if !target {
-                for &pkg in &pkgs {
-                    if self.alpm.localdb().pkg(pkg).is_ok() {
-                        return self.cache.get(pkg);
-                    }
-                }
             }
 
             if let Some(true_pkg) = pkgs.iter().position(|pkg| *pkg == dep.name()) {
@@ -1069,13 +1080,17 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
             )
         }
 
-        let pkgs = self.cache_aur_pkgs(&pkgs, target).await?;
+        let mut cached_pkgs = self.cache_aur_pkgs(&pkgs, target).await?;
         if self.flags.contains(Flags::NO_DEPS) {
             return Ok(Vec::new());
         }
 
+        cached_pkgs.extend(self.recursive_cache_satisfiers(&pkgs));
+        cached_pkgs.sort_unstable();
+        cached_pkgs.dedup();
+
         let mut new_pkgs = Vec::new();
-        for pkg in pkgs {
+        for pkg in cached_pkgs {
             let check = if self.flags.contains(Flags::CHECK_DEPENDS) {
                 Some(&pkg.check_depends)
             } else {
@@ -1654,6 +1669,149 @@ mod tests {
             .cache_aur_pkgs_recursive(&["ros-melodic-desktop-full"], &[], true)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pre_cached_callback_provider_with_installed_preference() {
+        // Arrange: an explicit target's callback may override the installed preference.
+        let alpm = alpm();
+        let mut raur = MockRaur::new();
+        raur.pkg("virtual-provider");
+        raur.pkg("provider-installed")
+            .provide("virtual-provider")
+            .make_depend("provider-build-dep");
+        raur.pkg("provider-build-dep");
+        raur.pkg("provider-cached-alternative")
+            .provide("virtual-provider")
+            .make_depend("alternative-provider-build-dep");
+        raur.pkg("alternative-provider-build-dep");
+
+        let mut cache = HashSet::new();
+        cache.insert(ArcPackage::new(raur.pkgs["provider-installed"].clone()));
+        cache.insert(ArcPackage::new(
+            raur.pkgs["provider-cached-alternative"].clone(),
+        ));
+        // Act
+        let actions = Resolver::new(
+            &alpm,
+            &mut cache,
+            &raur,
+            Flags::new() | Flags::RESOLVE_SATISFIED_PKGBUILDS,
+        )
+        .provider_callback(|_, packages| {
+            packages
+                .iter()
+                .position(|name| *name == "provider-cached-alternative")
+                .unwrap()
+        })
+        .resolve_targets(&["virtual-provider"])
+        .await
+        .unwrap();
+
+        // Assert
+        assert!(actions.missing.is_empty(), "{:?}", actions.missing);
+        let mut build = actions
+            .iter_aur_pkgs()
+            .map(|package| package.pkg.name.as_str())
+            .collect::<Vec<_>>();
+        build.sort_unstable();
+        assert_eq!(
+            build,
+            [
+                "alternative-provider-build-dep",
+                "provider-cached-alternative"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_cached_installed_provider_dependencies() {
+        let alpm = alpm();
+        let mut raur = MockRaur::new();
+        raur.pkg("provider-consumer").depend("virtual-provider");
+        raur.pkg("virtual-provider");
+        raur.pkg("provider-installed")
+            .provide("virtual-provider")
+            .make_depend("provider-build-dep");
+        raur.pkg("provider-build-dep");
+
+        let mut cache = HashSet::new();
+        cache.insert(ArcPackage::new(raur.pkgs["provider-installed"].clone()));
+
+        let actions = Resolver::new(
+            &alpm,
+            &mut cache,
+            &raur,
+            Flags::new() | Flags::RESOLVE_SATISFIED_PKGBUILDS,
+        )
+        .resolve_targets(&["provider-consumer"])
+        .await
+        .unwrap();
+
+        let mut build = actions
+            .iter_aur_pkgs()
+            .map(|pkg| pkg.pkg.name.as_str())
+            .collect::<Vec<_>>();
+        build.sort_unstable();
+
+        assert!(actions.missing.is_empty());
+        assert_eq!(
+            build,
+            [
+                "provider-build-dep",
+                "provider-consumer",
+                "provider-installed"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_cached_callback_provider_dependencies() {
+        let alpm = alpm();
+        let mut raur = MockRaur::new();
+        raur.pkg("provider-consumer").depend("virtual-provider");
+        raur.pkg("virtual-provider-fetched")
+            .provide("virtual-provider")
+            .make_depend("fetched-provider-build-dep");
+        raur.pkg("fetched-provider-build-dep");
+        raur.pkg("cached-provider")
+            .provide("virtual-provider")
+            .make_depend("cached-provider-build-dep");
+        raur.pkg("cached-provider-build-dep");
+
+        let mut cache = HashSet::new();
+        cache.insert(ArcPackage::new(raur.pkgs["cached-provider"].clone()));
+
+        let actions = Resolver::new(
+            &alpm,
+            &mut cache,
+            &raur,
+            Flags::new() | Flags::RESOLVE_SATISFIED_PKGBUILDS,
+        )
+        .provider_callback(|_, pkgs| {
+            pkgs.iter()
+                .position(|pkg| *pkg == "cached-provider")
+                .unwrap()
+        })
+        .resolve_targets(&["provider-consumer"])
+        .await
+        .unwrap();
+
+        let mut build = actions
+            .iter_aur_pkgs()
+            .map(|pkg| pkg.pkg.name.as_str())
+            .collect::<Vec<_>>();
+        build.sort_unstable();
+
+        assert!(actions.missing.is_empty());
+        assert_eq!(
+            build,
+            [
+                "cached-provider",
+                "cached-provider-build-dep",
+                "provider-consumer"
+            ]
+        );
     }
 
     #[tokio::test]

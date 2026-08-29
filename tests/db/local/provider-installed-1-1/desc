@@ -1,0 +1,35 @@
+%NAME%
+provider-installed
+
+%VERSION%
+1-1
+
+%BASE%
+provider-installed
+
+%DESC%
+Installed provider resolver test fixture
+
+%ARCH%
+x86_64
+
+%BUILDDATE%
+0
+
+%INSTALLDATE%
+0
+
+%PACKAGER%
+Test Suite
+
+%SIZE%
+0
+
+%LICENSE%
+MIT
+
+%VALIDATION%
+none
+
+%PROVIDES%
+virtual-provider

@@ -1,11 +1,14 @@
-use crate::actions::{Actions, AurPackage, DepMissing, Missing, RepoPackage, Unneeded};
+use crate::actions::{
+    Actions, AurPackage, DepMissing, DependencySatisfier, Missing, RepoPackage, ResolvedDependency,
+    Unneeded,
+};
 use crate::base::Base;
 use crate::cb::{Group, GroupCB, IsDevelCb, ProviderCB};
 use crate::pkgbuild::PkgbuildRepo;
 use crate::satisfies::{Satisfies, satisfies_provide};
 use crate::{AurBase, Error, Pkgbuild, PkgbuildPackages};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use alpm::{Alpm, Dep, Depend, Version};
 use alpm_utils::{AsTarg, DbListExt, Targ};
@@ -107,6 +110,13 @@ impl<'a> AurOrPkgbuild<'a> {
         }
     }
 
+    fn name(&self) -> &str {
+        match self {
+            AurOrPkgbuild::Aur(pkg) => &pkg.name,
+            AurOrPkgbuild::Pkgbuild(_, _, pkg) => &pkg.pkgname,
+        }
+    }
+
     fn depends(&self, arch: &str, check_depends: bool) -> Vec<&str> {
         match self {
             AurOrPkgbuild::Aur(pkg) => {
@@ -188,6 +198,8 @@ pub struct Resolver<'a, 'b, H = raur::Handle> {
     pub(crate) alpm: &'a Alpm,
     pub(crate) repos: Vec<PkgbuildRepo<'a>>,
     pub(crate) resolved: HashSet<String>,
+    resolved_satisfiers: HashMap<String, DependencySatisfier>,
+    dependency_selections: HashSet<(String, String)>,
     pub(crate) cache: &'b mut Cache,
     pub(crate) stack: Vec<DepMissing>,
     pub(crate) raur: &'b H,
@@ -212,12 +224,15 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
             unneeded: Vec::new(),
             build: Vec::new(),
             install: Vec::new(),
+            resolved_dependencies: Vec::new(),
         };
 
         Resolver {
             alpm,
             repos: Vec::new(),
             resolved: HashSet::new(),
+            resolved_satisfiers: HashMap::new(),
+            dependency_selections: HashSet::new(),
             cache,
             stack: Vec::new(),
             actions,
@@ -686,6 +701,28 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
         }
     }
 
+    fn record_dependency(
+        &mut self,
+        consumer: &str,
+        dependency: &Dep,
+        satisfier: DependencySatisfier,
+    ) {
+        let declaration = dependency.to_string();
+        self.resolved_satisfiers
+            .entry(declaration.clone())
+            .or_insert_with(|| satisfier.clone());
+        if self
+            .dependency_selections
+            .insert((consumer.to_owned(), declaration))
+        {
+            self.actions.resolved_dependencies.push(ResolvedDependency {
+                consumer: consumer.to_owned(),
+                dependency: dependency.to_depend(),
+                satisfier,
+            });
+        }
+    }
+
     fn resolve_aur_pkg_deps(
         &mut self,
         targs: &[&str],
@@ -695,16 +732,34 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
         debug!("resolve pkgbuild repo pkg deps: {}", pkg.pkgbase());
         let nover = self.flags.contains(Flags::NO_DEP_VERSION);
         let check = self.flags.contains(Flags::CHECK_DEPENDS);
+        let consumer = pkg.name();
         if !self.flags.contains(Flags::NO_DEPS) {
             for dep_str in pkg.depends(self.arch(), check) {
                 debug!("depend: {}", dep_str);
                 let dep = Depend::new(dep_str.to_string());
 
-                if self.assume_installed(&dep)
-                    || self.satisfied_build(&dep)
-                    || self.resolved.contains(&dep.to_string())
-                    || self.satisfied_install(&dep)
-                {
+                if self.assume_installed(&dep) {
+                    self.record_dependency(consumer, &dep, DependencySatisfier::Assumed);
+                    continue;
+                }
+                if let Some(package) = self.find_build_satisfier(&dep) {
+                    let satisfier = DependencySatisfier::Build(package.to_owned());
+                    self.record_dependency(consumer, &dep, satisfier);
+                    continue;
+                }
+                if self.resolved.contains(&dep.to_string()) {
+                    if let Some(satisfier) = self.resolved_satisfiers.get(&dep.to_string()).cloned()
+                    {
+                        self.record_dependency(consumer, &dep, satisfier);
+                    }
+                    continue;
+                }
+                if let Some(package) = self.find_install_satisfier(&dep) {
+                    self.record_dependency(
+                        consumer,
+                        &dep,
+                        DependencySatisfier::Repository(package.name().to_owned()),
+                    );
                     continue;
                 }
 
@@ -718,13 +773,29 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
 
                 if !is_aur_targ && !same_pkgbuild {
                     if !self.flags.contains(Flags::RESOLVE_SATISFIED_PKGBUILDS)
-                        && self.satisfied_local(&dep)
+                        && let Some(package) = self.find_local_satisfier(&dep)
                     {
+                        self.record_dependency(
+                            consumer,
+                            &dep,
+                            DependencySatisfier::Installed(package.name().to_owned()),
+                        );
                         continue;
                     }
                     let depstr = dep.to_string();
                     if let Some(pkg) = self.find_repo_satisfier(&depstr) {
-                        if !self.satisfied_local(&dep) {
+                        if let Some(local) = self.find_local_satisfier(&dep) {
+                            self.record_dependency(
+                                consumer,
+                                &dep,
+                                DependencySatisfier::Installed(local.name().to_owned()),
+                            );
+                        } else {
+                            self.record_dependency(
+                                consumer,
+                                &dep,
+                                DependencySatisfier::Repository(pkg.name().to_owned()),
+                            );
                             self.stack
                                 .push(DepMissing::new(pkg.name().to_string(), depstr));
                             self.resolve_repo_pkg(pkg, false, true);
@@ -735,6 +806,13 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
                 }
 
                 if !same_pkgbuild && self.should_skip_aur_pkg(&dep, is_aur_targ) {
+                    if let Some(package) = self.find_local_satisfier(&dep) {
+                        self.record_dependency(
+                            consumer,
+                            &dep,
+                            DependencySatisfier::Installed(package.name().to_owned()),
+                        );
+                    }
                     continue;
                 }
 
@@ -742,6 +820,11 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
                     let repo = repo.to_string();
                     let base = base.clone();
                     let pkg = pkg.clone();
+                    self.record_dependency(
+                        consumer,
+                        &dep,
+                        DependencySatisfier::Build(pkg.pkgname.clone()),
+                    );
                     self.stack
                         .push(DepMissing::new(pkg.pkgname.to_string(), dep.to_string()));
                     self.resolve_aur_pkg_deps(
@@ -780,6 +863,11 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
                     continue;
                 };
 
+                self.record_dependency(
+                    consumer,
+                    &dep,
+                    DependencySatisfier::Build(sat_pkg.name.clone()),
+                );
                 self.stack
                     .push(DepMissing::new(sat_pkg.name.to_string(), dep.to_string()));
                 self.resolve_aur_pkg_deps(targs, AurOrPkgbuild::Aur(&sat_pkg), true)?;
@@ -843,7 +931,7 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
 
         if !self.flags.contains(Flags::NO_DEPS) {
             for dep in pkg.depends() {
-                if self.satisfied_install(dep)
+                if self.find_install_satisfier(dep).is_some()
                     || self.satisfied_local(dep)
                     || self.assume_installed(dep)
                 {
@@ -1128,55 +1216,61 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
         Ok(new_pkgs)
     }
 
-    fn satisfied_build(&self, target: &Dep) -> bool {
+    fn find_build_satisfier(&self, target: &Dep) -> Option<&str> {
         for build in &self.actions.build {
             match build {
                 Base::Aur(pkgs) => {
-                    if pkgs.pkgs.iter().any(|b| {
-                        b.pkg
+                    if let Some(package) = pkgs.pkgs.iter().find(|package| {
+                        package
+                            .pkg
                             .satisfies_dep(target, self.flags.contains(Flags::NO_DEP_VERSION))
                     }) {
-                        return true;
+                        return Some(&package.pkg.name);
                     }
                 }
                 Base::Pkgbuild(pkgs) => {
-                    if pkgs.pkgs.iter().any(|pkg| {
-                        (&*pkgs.srcinfo, &pkg.pkg)
+                    if let Some(package) = pkgs.pkgs.iter().find(|package| {
+                        (&*pkgs.srcinfo, &package.pkg)
                             .satisfies_dep(target, self.flags.contains(Flags::NO_DEP_VERSION))
                     }) {
-                        return true;
+                        return Some(&package.pkg.pkgname);
                     }
                 }
             }
         }
-        false
+        None
     }
 
-    fn satisfied_install(&self, target: &Dep) -> bool {
-        self.actions.install.iter().any(|install| {
-            install
-                .pkg
-                .satisfies_dep(target, self.flags.contains(Flags::NO_DEP_VERSION))
-        })
+    fn find_install_satisfier(&self, target: &Dep) -> Option<&'a alpm::Package> {
+        self.actions
+            .install
+            .iter()
+            .find(|install| {
+                install
+                    .pkg
+                    .satisfies_dep(target, self.flags.contains(Flags::NO_DEP_VERSION))
+            })
+            .map(|install| install.pkg)
     }
 
     fn satisfied_local(&self, target: &Dep) -> bool {
+        self.find_local_satisfier(target).is_some()
+    }
+
+    fn find_local_satisfier(&self, target: &Dep) -> Option<&'a alpm::Package> {
         if let Ok(pkg) = self.alpm.localdb().pkg(target.name())
             && pkg.satisfies_dep(target, self.flags.contains(Flags::NO_DEP_VERSION))
         {
-            return true;
+            return Some(pkg);
         }
 
         if self.flags.contains(Flags::NO_DEP_VERSION) {
-            let ret = self.alpm.localdb().pkgs().find_satisfier(target.name());
-            ret.is_some()
+            self.alpm.localdb().pkgs().find_satisfier(target.name())
         } else {
-            let ret = self
-                .alpm
+            self.alpm
                 .localdb()
                 .pkgs()
-                .find_satisfier(target.to_string());
-            ret.is_some()
+                .find_satisfier(target.to_string())
         }
     }
 
@@ -1812,6 +1906,204 @@ mod tests {
                 "provider-consumer"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_dependency_selections_preserve_automatic_providers() {
+        let alpm = alpm();
+        let mut raur = MockRaur::new();
+        raur.pkg("warmup").depend("virtual-provider");
+        raur.pkg("provider-consumer").depend("virtual-provider");
+        raur.pkg("virtual-provider");
+        raur.pkg("provider-installed")
+            .provide("virtual-provider")
+            .make_depend("provider-build-dep");
+        raur.pkg("provider-build-dep");
+        let mut cache = HashSet::new();
+        cache.insert(ArcPackage::new(raur.pkgs["provider-installed"].clone()));
+        let actions = Resolver::new(
+            &alpm,
+            &mut cache,
+            &raur,
+            Flags::new() | Flags::RESOLVE_SATISFIED_PKGBUILDS,
+        )
+        .provider_callback(|_, _| 0)
+        .resolve_targets(&["warmup", "virtual-provider", "provider-consumer"])
+        .await
+        .unwrap();
+        assert!(actions.missing.is_empty());
+        for consumer in ["warmup", "provider-consumer"] {
+            let selection = actions
+                .resolved_dependencies()
+                .iter()
+                .find(|selection| {
+                    selection.consumer() == consumer
+                        && selection.dependency().name() == "virtual-provider"
+                })
+                .unwrap();
+            assert_eq!(
+                selection.satisfier(),
+                &crate::DependencySatisfier::Build("provider-installed".to_owned())
+            );
+        }
+        assert!(
+            !actions
+                .resolved_dependencies()
+                .iter()
+                .any(|selection| selection.consumer() == "virtual-provider")
+        );
+        let selection = actions
+            .resolved_dependencies()
+            .iter()
+            .find(|selection| selection.consumer() == "provider-installed")
+            .unwrap();
+        assert_eq!(
+            selection.satisfier(),
+            &crate::DependencySatisfier::Build("provider-build-dep".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dependency_selections_snapshot_each_consumers_choice() {
+        // Arrange: target order can change later choices, not earlier snapshots.
+        let alpm = alpm();
+        let mut raur = MockRaur::new();
+        raur.pkg("early").depend("virtual-provider");
+        raur.pkg("late").depend("virtual-provider");
+        raur.pkg("explicit-provider").provide("virtual-provider");
+        raur.pkg("provider-installed").provide("virtual-provider");
+        for (targets, early_source) in [
+            (
+                ["early", "explicit-provider", "late"],
+                crate::DependencySatisfier::Installed("provider-installed".to_owned()),
+            ),
+            (
+                ["explicit-provider", "early", "late"],
+                crate::DependencySatisfier::Build("explicit-provider".to_owned()),
+            ),
+        ] {
+            let mut cache = HashSet::new();
+            cache.insert(ArcPackage::new(raur.pkgs["provider-installed"].clone()));
+
+            // Act
+            let actions = Resolver::new(&alpm, &mut cache, &raur, Flags::new())
+                .resolve_targets(&targets)
+                .await
+                .unwrap();
+
+            // Assert
+            assert!(actions.missing.is_empty(), "{:?}", actions.missing);
+            let source = |consumer| {
+                actions
+                    .resolved_dependencies()
+                    .iter()
+                    .find(|selection| selection.consumer() == consumer)
+                    .unwrap()
+                    .satisfier()
+            };
+            assert_eq!(source("early"), &early_source);
+            assert_eq!(
+                source("late"),
+                &crate::DependencySatisfier::Build("explicit-provider".to_owned())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dependency_selections_omit_repository_consumers() {
+        // Arrange
+        let alpm = alpm();
+        let raur = MockRaur::new();
+        let mut cache = HashSet::new();
+
+        // Act
+        let actions = Resolver::new(&alpm, &mut cache, &raur, Flags::new())
+            .resolve_targets(&["jq"])
+            .await
+            .unwrap();
+
+        // Assert
+        assert!(actions.missing.is_empty(), "{:?}", actions.missing);
+        assert!(actions.build.is_empty());
+        assert!(actions.resolved_dependencies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dependency_selection_sources() {
+        let alpm = alpm();
+        let mut raur = MockRaur::new();
+        raur.pkg("source-consumer")
+            .depend("glibc")
+            .depend("jq")
+            .depend("assume-dep1");
+        for flags in [
+            Flags::new(),
+            Flags::new() | Flags::RESOLVE_SATISFIED_PKGBUILDS,
+        ] {
+            let mut cache = HashSet::new();
+            let actions = Resolver::new(&alpm, &mut cache, &raur, flags)
+                .resolve_targets(&["source-consumer"])
+                .await
+                .unwrap();
+            assert!(actions.missing.is_empty());
+            let source = |dependency: &str| {
+                actions
+                    .resolved_dependencies()
+                    .iter()
+                    .find(|selection| {
+                        selection.consumer() == "source-consumer"
+                            && selection.dependency().name() == dependency
+                    })
+                    .unwrap()
+                    .satisfier()
+            };
+            assert_eq!(
+                source("glibc"),
+                &crate::DependencySatisfier::Installed("glibc".to_owned())
+            );
+            assert_eq!(
+                source("jq"),
+                &crate::DependencySatisfier::Repository("jq".to_owned())
+            );
+            assert_eq!(source("assume-dep1"), &crate::DependencySatisfier::Assumed);
+        }
+        let mut cache = HashSet::new();
+        let actions = Resolver::new(&alpm, &mut cache, &raur, Flags::new() | Flags::NO_DEPS)
+            .resolve_targets(&["source-consumer"])
+            .await
+            .unwrap();
+        assert!(actions.resolved_dependencies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pkgbuild_dependency_selections_include_global_requirements() {
+        let alpm = alpm();
+        let raur = MockRaur::new();
+        let library: srcinfo::Srcinfo = "pkgbase = library\n pkgver = 1\n pkgrel = 1\n arch = any\npkgname = built-library\n provides = virtual-library\n".parse().unwrap();
+        let consumer: srcinfo::Srcinfo = "pkgbase = consumer\n pkgver = 1\n pkgrel = 1\n arch = any\n depends = virtual-library\npkgname = source-consumer\n depends = built-library\n".parse().unwrap();
+        let repos = vec![PkgbuildRepo {
+            name: "fixtures",
+            pkgs: vec![&library, &consumer],
+        }];
+        let mut cache = HashSet::new();
+        let actions = Resolver::new(&alpm, &mut cache, &raur, Flags::new())
+            .pkgbuild_repos(repos)
+            .resolve_targets(&[Targ::new(Some("fixtures"), "source-consumer")])
+            .await
+            .unwrap();
+        assert!(actions.missing.is_empty());
+        let selections = actions
+            .resolved_dependencies()
+            .iter()
+            .filter(|selection| selection.consumer() == "source-consumer")
+            .collect::<Vec<_>>();
+        assert_eq!(selections.len(), 2);
+        for selection in selections {
+            assert_eq!(
+                selection.satisfier(),
+                &crate::DependencySatisfier::Build("built-library".to_owned())
+            );
+        }
     }
 
     #[tokio::test]

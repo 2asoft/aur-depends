@@ -23,9 +23,66 @@ pub struct Actions<'a> {
     pub build: Vec<Base>,
     /// Repo packages to install.
     pub install: Vec<RepoPackage<'a>>,
+    pub(crate) resolved_dependencies: Vec<ResolvedDependency>,
+}
+
+/// The selected source of a dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencySatisfier {
+    /// A package included in the build plan, identified by package name.
+    Build(String),
+    /// A package supplied by a sync repository, identified by package name.
+    Repository(String),
+    /// A package supplied by the local database, identified by package name.
+    Installed(String),
+    /// A dependency satisfied by the resolver's assume-installed configuration.
+    Assumed,
+}
+
+/// A dependency selection captured for one consuming AUR or PKGBUILD package.
+///
+/// Explicit target selections are not dependency selections. Missing dependencies
+/// have no satisfier and remain in [`Actions::missing`].
+#[derive(Debug, Clone)]
+pub struct ResolvedDependency {
+    pub(crate) consumer: String,
+    pub(crate) dependency: Depend,
+    pub(crate) satisfier: DependencySatisfier,
+}
+
+impl ResolvedDependency {
+    /// The package that declares the dependency.
+    pub fn consumer(&self) -> &str {
+        &self.consumer
+    }
+
+    /// The dependency as declared during resolution.
+    pub fn dependency(&self) -> &Dep {
+        &self.dependency
+    }
+
+    /// The selected source, including automatic and reused selections.
+    pub fn satisfier(&self) -> &DependencySatisfier {
+        &self.satisfier
+    }
 }
 
 impl<'a> Actions<'a> {
+    /// Dependency selections for AUR and PKGBUILD consumers, in resolution order.
+    ///
+    /// Each consumer and dependency declaration has at most one entry. Assumed
+    /// dependencies are included. With dependency resolution disabled, this is empty.
+    /// Repository consumers are not included.
+    ///
+    /// This is a resolution snapshot: later explicit targets do not rewrite existing
+    /// entries, but can affect later consumers through normal resolver precedence.
+    /// Mutating the public build or install lists does not update this snapshot.
+    /// A selection does not establish satisfaction in another environment or for a
+    /// changed dependency declaration.
+    pub fn resolved_dependencies(&self) -> &[ResolvedDependency] {
+        &self.resolved_dependencies
+    }
+
     /// An iterator over each AUR package in self.build.
     pub fn iter_aur_pkgs(&self) -> impl Iterator<Item = &AurPackage> {
         self.build

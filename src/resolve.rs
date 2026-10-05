@@ -806,13 +806,6 @@ impl<'a, 'b, E: std::error::Error + Sync + Send + 'static, H: Raur<Err = E> + Sy
                 }
 
                 if !same_pkgbuild && self.should_skip_aur_pkg(&dep, is_aur_targ) {
-                    if let Some(package) = self.find_local_satisfier(&dep) {
-                        self.record_dependency(
-                            consumer,
-                            &dep,
-                            DependencySatisfier::Installed(package.name().to_owned()),
-                        );
-                    }
                     continue;
                 }
 
